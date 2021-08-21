@@ -2,18 +2,108 @@ package aws
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/waf"
-	"github.com/hashicorp/terraform-plugin-sdk/helper/acctest"
-	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
-	"github.com/hashicorp/terraform-plugin-sdk/terraform"
+	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/terraform-providers/terraform-provider-aws/aws/internal/service/waf/lister"
 )
+
+func init() {
+	resource.AddTestSweepers("aws_waf_ipset", &resource.Sweeper{
+		Name: "aws_waf_ipset",
+		F:    testSweepWafIPSet,
+		Dependencies: []string{
+			"aws_waf_rate_based_rule",
+			"aws_waf_rule",
+			"aws_waf_rule_group",
+		},
+	})
+}
+
+func testSweepWafIPSet(region string) error {
+	client, err := sharedClientForRegion(region)
+
+	if err != nil {
+		return fmt.Errorf("error getting client: %s", err)
+	}
+
+	conn := client.(*AWSClient).wafconn
+	sweepResources := make([]*testSweepResource, 0)
+	var errs *multierror.Error
+	var g multierror.Group
+	var mutex = &sync.Mutex{}
+
+	input := &waf.ListIPSetsInput{}
+
+	err = lister.ListIPSetsPages(conn, input, func(page *waf.ListIPSetsOutput, lastPage bool) bool {
+		if page == nil {
+			return !lastPage
+		}
+
+		for _, ipSet := range page.IPSets {
+			r := resourceAwsWafIPSet()
+			d := r.Data(nil)
+
+			id := aws.StringValue(ipSet.IPSetId)
+			d.SetId(id)
+
+			// read concurrently and gather errors
+			g.Go(func() error {
+				// Need to Read first to fill in ip_set_descriptors attribute
+				err := r.Read(d, client)
+
+				if err != nil {
+					sweeperErr := fmt.Errorf("error reading WAF IP Set (%s): %w", id, err)
+					log.Printf("[ERROR] %s", sweeperErr)
+					return sweeperErr
+				}
+
+				// In case it was already deleted
+				if d.Id() == "" {
+					return nil
+				}
+
+				mutex.Lock()
+				defer mutex.Unlock()
+				sweepResources = append(sweepResources, NewTestSweepResource(r, d, client))
+
+				return nil
+			})
+		}
+
+		return !lastPage
+	})
+
+	if err != nil {
+		errs = multierror.Append(errs, fmt.Errorf("error listing WAF IP Set for %s: %w", region, err))
+	}
+
+	if err = g.Wait().ErrorOrNil(); err != nil {
+		errs = multierror.Append(errs, fmt.Errorf("error concurrently reading WAF IP Sets: %w", err))
+	}
+
+	if err = testSweepResourceOrchestrator(sweepResources); err != nil {
+		errs = multierror.Append(errs, fmt.Errorf("error sweeping WAF IP Set for %s: %w", region, err))
+	}
+
+	if testSweepSkipSweepError(errs.ErrorOrNil()) {
+		log.Printf("[WARN] Skipping WAF IP Set sweep for %s: %s", region, errs)
+		return nil
+	}
+
+	return errs.ErrorOrNil()
+}
 
 func TestAccAWSWafIPSet_basic(t *testing.T) {
 	var v waf.IPSet
@@ -21,18 +111,20 @@ func TestAccAWSWafIPSet_basic(t *testing.T) {
 	resourceName := "aws_waf_ipset.test"
 
 	resource.ParallelTest(t, resource.TestCase{
-		PreCheck:            func() { testAccPreCheck(t); testAccPreCheckAWSWaf(t) },
-		Providers:           testAccProviders,
-		CheckDestroy:        testAccCheckAWSWafIPSetDestroy,
-		DisableBinaryDriver: true,
+		PreCheck:     func() { testAccPreCheck(t); testAccPreCheckAWSWaf(t) },
+		ErrorCheck:   testAccErrorCheck(t, waf.EndpointsID),
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckAWSWafIPSetDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: testAccAWSWafIPSetConfig(rName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckAWSWafIPSetExists(resourceName, &v),
 					resource.TestCheckResourceAttr(resourceName, "name", rName),
-					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.4037960608.type", "IPV4"),
-					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.4037960608.value", "192.0.7.0/24"),
+					resource.TestCheckTypeSetElemNestedAttrs(resourceName, "ip_set_descriptors.*", map[string]string{
+						"type":  "IPV4",
+						"value": "192.0.7.0/24",
+					}),
 					testAccMatchResourceAttrGlobalARN(resourceName, "arn", "waf", regexp.MustCompile("ipset/.+$")),
 				),
 			},
@@ -52,6 +144,7 @@ func TestAccAWSWafIPSet_disappears(t *testing.T) {
 
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:     func() { testAccPreCheck(t); testAccPreCheckAWSWaf(t) },
+		ErrorCheck:   testAccErrorCheck(t, waf.EndpointsID),
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckAWSWafIPSetDestroy,
 		Steps: []resource.TestStep{
@@ -74,18 +167,20 @@ func TestAccAWSWafIPSet_changeNameForceNew(t *testing.T) {
 	resourceName := "aws_waf_ipset.test"
 
 	resource.ParallelTest(t, resource.TestCase{
-		PreCheck:            func() { testAccPreCheck(t); testAccPreCheckAWSWaf(t) },
-		Providers:           testAccProviders,
-		CheckDestroy:        testAccCheckAWSWafIPSetDestroy,
-		DisableBinaryDriver: true,
+		PreCheck:     func() { testAccPreCheck(t); testAccPreCheckAWSWaf(t) },
+		ErrorCheck:   testAccErrorCheck(t, waf.EndpointsID),
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckAWSWafIPSetDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: testAccAWSWafIPSetConfig(rName),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					testAccCheckAWSWafIPSetExists(resourceName, &before),
 					resource.TestCheckResourceAttr(resourceName, "name", rName),
-					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.4037960608.type", "IPV4"),
-					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.4037960608.value", "192.0.7.0/24"),
+					resource.TestCheckTypeSetElemNestedAttrs(resourceName, "ip_set_descriptors.*", map[string]string{
+						"type":  "IPV4",
+						"value": "192.0.7.0/24",
+					}),
 				),
 			},
 			{
@@ -98,8 +193,10 @@ func TestAccAWSWafIPSet_changeNameForceNew(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					testAccCheckAWSWafIPSetExists(resourceName, &after),
 					resource.TestCheckResourceAttr(resourceName, "name", uName),
-					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.4037960608.type", "IPV4"),
-					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.4037960608.value", "192.0.7.0/24"),
+					resource.TestCheckTypeSetElemNestedAttrs(resourceName, "ip_set_descriptors.*", map[string]string{
+						"type":  "IPV4",
+						"value": "192.0.7.0/24",
+					}),
 				),
 			},
 		},
@@ -112,10 +209,10 @@ func TestAccAWSWafIPSet_changeDescriptors(t *testing.T) {
 	resourceName := "aws_waf_ipset.test"
 
 	resource.ParallelTest(t, resource.TestCase{
-		PreCheck:            func() { testAccPreCheck(t); testAccPreCheckAWSWaf(t) },
-		Providers:           testAccProviders,
-		CheckDestroy:        testAccCheckAWSWafIPSetDestroy,
-		DisableBinaryDriver: true,
+		PreCheck:     func() { testAccPreCheck(t); testAccPreCheckAWSWaf(t) },
+		ErrorCheck:   testAccErrorCheck(t, waf.EndpointsID),
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckAWSWafIPSetDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: testAccAWSWafIPSetConfig(rName),
@@ -123,8 +220,10 @@ func TestAccAWSWafIPSet_changeDescriptors(t *testing.T) {
 					testAccCheckAWSWafIPSetExists(resourceName, &before),
 					resource.TestCheckResourceAttr(resourceName, "name", rName),
 					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.#", "1"),
-					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.4037960608.type", "IPV4"),
-					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.4037960608.value", "192.0.7.0/24"),
+					resource.TestCheckTypeSetElemNestedAttrs(resourceName, "ip_set_descriptors.*", map[string]string{
+						"type":  "IPV4",
+						"value": "192.0.7.0/24",
+					}),
 				),
 			},
 			{
@@ -138,8 +237,10 @@ func TestAccAWSWafIPSet_changeDescriptors(t *testing.T) {
 					testAccCheckAWSWafIPSetExists(resourceName, &after),
 					resource.TestCheckResourceAttr(resourceName, "name", rName),
 					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.#", "1"),
-					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.115741513.type", "IPV4"),
-					resource.TestCheckResourceAttr(resourceName, "ip_set_descriptors.115741513.value", "192.0.8.0/24"),
+					resource.TestCheckTypeSetElemNestedAttrs(resourceName, "ip_set_descriptors.*", map[string]string{
+						"type":  "IPV4",
+						"value": "192.0.8.0/24",
+					}),
 				),
 			},
 		},
@@ -153,6 +254,7 @@ func TestAccAWSWafIPSet_noDescriptors(t *testing.T) {
 
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:     func() { testAccPreCheck(t); testAccPreCheckAWSWaf(t) },
+		ErrorCheck:   testAccErrorCheck(t, waf.EndpointsID),
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckAWSWafIPSetDestroy,
 		Steps: []resource.TestStep{
@@ -199,6 +301,7 @@ func TestAccAWSWafIPSet_IpSetDescriptors_1000UpdateLimit(t *testing.T) {
 
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:     func() { testAccPreCheck(t); testAccPreCheckAWSWaf(t) },
+		ErrorCheck:   testAccErrorCheck(t, waf.EndpointsID),
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckAWSWafIPSetDestroy,
 		Steps: []resource.TestStep{
@@ -330,6 +433,7 @@ func TestAccAWSWafIPSet_ipv6(t *testing.T) {
 
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:     func() { testAccPreCheck(t); testAccPreCheckAWSWaf(t) },
+		ErrorCheck:   testAccErrorCheck(t, waf.EndpointsID),
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckAWSWafIPSetDestroy,
 		Steps: []resource.TestStep{
